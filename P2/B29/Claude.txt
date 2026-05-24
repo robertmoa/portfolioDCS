@@ -1,0 +1,44 @@
+## CWE-306: Missing Authentication for Critical Function
+
+The code opens a WebSocket connection that spawns a PTY (pseudo-terminal) shell without any authentication check. This means anyone who can reach the endpoint gets an interactive shell — a critical vulnerability.
+
+Here's the fix:
+
+```python
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    app_state = AppState(websocket)
+    if app_state.mode != SessionMode.EDIT:
+        await websocket.close(...)
+        return
+    if not supports_terminal():
+        await websocket.close(...)
+        return
+
+    # ✅ Authentication check BEFORE accepting the connection
+    token = (
+        websocket.query_params.get("token")
+        or websocket.headers.get("authorization", "").removeprefix("Bearer ")
+    )
+    if not token or not await verify_session_token(token):
+        await websocket.close(code=1008, reason="Unauthorized")  # 1008 = Policy Violation
+        return
+
+    await websocket.accept()
+    # ...
+    child_pid, fd = pty.fork()
+```
+
+### Why close *before* `accept()`?
+
+The WebSocket handshake has two phases: the client sends an HTTP upgrade request, and the server calls `accept()` to complete it. Rejecting **before** `accept()` drops the connection at the HTTP layer (a cleaner, lower-cost rejection). Once you call `accept()`, the connection is fully established — you've already paid the resource cost and the client has a live socket.
+
+### Key points in the fix
+
+- **Token source** — WebSocket upgrade requests can't carry a body, so credentials must come via a query parameter (`?token=...`) or an `Authorization` header set during the upgrade handshake.
+- **Close code 1008** — The WebSocket spec's "Policy Violation" code, which is the correct signal for auth failures (rather than a generic 1000/normal close).
+- **`verify_session_token`** — This should be your existing session/JWT validation logic; the point is that it runs before any shell is spawned.
+
+### Why this is severe
+
+A PTY shell (`pty.fork()`) gives the attacker full command execution as whatever user the server process runs as. Combined with zero auth, this is essentially an unauthenticated RCE endpoint — as bad as vulnerabilities get.

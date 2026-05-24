@@ -1,0 +1,73 @@
+The code you provided contains a critical security vulnerability: it exposes a pseudo-terminal (PTY) shell over a WebSocket connection without performing any authentication or authorization checks.
+
+Here is the breakdown of the CWE identified and how to fix it.
+
+---
+
+### The CWE Identified
+
+The primary vulnerability here is **CWE-306: Missing Authentication for Critical Function**.
+
+Because the code initializes a PTY shell (`pty.fork()`)—which grants command-line access to the underlying server—accepting the WebSocket connection without verifying the user's identity allows *anyone* to execute arbitrary commands on your host system. This is a classic recipe for Remote Code Execution (RCE).
+
+Additionally, it touches on **CWE-285: Improper Authorization**, as it fails to check if the connected user has the necessary privileges to access the terminal session.
+
+---
+
+### The Fix
+
+To fix this, you need to validate a token (like a JWT or an API key) before calling `await websocket.accept()`. In FastAPI, WebSocket authentication is typically handled by reading a token from the query parameters, headers, or cookies during the initial handshake.
+
+Here is how you can secure the endpoint using a query parameter token check:
+
+```python
+from fastapi import HTTPException, status, WebSocket, Depends
+
+# Hypothetical authentication helper
+async def get_current_user_from_token(token: str) -> User:
+    user = verify_token(token)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    return user
+
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    # 1. Extract the token from the query string before accepting the connection
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        # 2. Authenticate and authorize the user
+        user = await get_current_user_from_token(token)
+        if not user.has_terminal_access():
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # 3. Proceed with your standard environment checks
+    app_state = AppState(websocket)
+    if app_state.mode != SessionMode.EDIT:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+        
+    if not supports_terminal():
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
+    # 4. Safely accept the connection now that authorization is verified
+    await websocket.accept()  
+    
+    # ...
+    child_pid, fd = pty.fork()  
+
+```
+
+### Key Changes Explained
+
+* **Pre-Acceptance Check:** The authentication check happens *before* `await websocket.accept()`. If the token is missing or invalid, the connection is rejected immediately.
+* **WebSocket Close Codes:** Instead of generic close arguments, it uses standard WebSocket close codes like `1008` (`WS_1008_POLICY_VIOLATION`), which is the correct semantic code for authentication or policy failures.
+* **Authorization Check:** It ensures that even if a user is logged in, they explicitly have permission to spawn a terminal (`user.has_terminal_access()`).
